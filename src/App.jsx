@@ -19,7 +19,7 @@ const EVENT_STATUS_OPTIONS = ['Planned', 'Active', 'Completed', 'Cancelled']
 const PARTICIPANT_ROLE_OPTIONS = ['Speaker', 'Sponsor', 'Delegate']
 const PARTICIPANT_STATUS_OPTIONS = ['Invited', 'Confirmed', 'Attended', 'Cancelled']
 const INDUSTRY_OPTIONS = ['Insurance', 'Banking', 'Finance']
-const LEAD_PURPOSE_CHOICES = ['Delegate Acquisition', 'Speaker Acquisition', 'Sponsor Acquisition']
+const LEAD_PURPOSE_CHOICES = ['Delegate Acquisition', 'Sponsor Acquisition', 'ABM', 'Not Categorized Yet']
 // people.owner_email — must exactly match what the Make.com send scenario
 // matches against ( alia@ / abdool@ / chris@connectiva.events). A
 // free-text input here risks the exact same silent-mismatch bug found
@@ -70,6 +70,8 @@ const NAV_ITEMS = [
   { key: 'events', label: 'Events', icon: Calendar },
   { key: 'attendees', label: 'Attendees', icon: UserCheck },
   { key: 'agenda', label: 'Agenda', icon: List },
+  { key: 'sponsors', label: 'Sponsors', icon: Target },
+  { key: 'display-order', label: 'Display Order', icon: UserCheck },
   { key: 'approval', label: 'Approval', icon: Mail },
   { key: 'create', label: 'Create', icon: UserPlus },
 ]
@@ -1155,6 +1157,8 @@ const navigatePerson = (personId) => {
         leads: { title: 'Leads', sub: 'Every lead across every channel' },
         events: { title: 'Events', sub: 'Events and who attended them' },
         agenda: { title: 'Agenda', sub: 'Manage agenda sessions and programme details' },
+        sponsors: { title: 'Sponsors', sub: 'Manage sponsorship deals by event' },
+        'display-order': { title: 'Display Order', sub: 'Manage Advisory Board and Speaker display order' },
         attendees: { title: 'Attendees', sub: 'Manage who is attached to each event' },
         create: { title: 'Create', sub: 'Add a new event or person' },
       }[activePage]
@@ -1228,6 +1232,12 @@ const navigatePerson = (personId) => {
           )}
           {!detail && activePage === 'agenda' && (
             <AgendaPage showToast={showToast} />
+          )}
+          {!detail && activePage === 'sponsors' && (
+            <SponsorsPage showToast={showToast} />
+          )}
+          {!detail && activePage === 'display-order' && (
+            <DisplayOrderPage showToast={showToast} />
           )}
           {!detail && activePage === 'leads' && <LeadsPage showToast={showToast} onOpenLead={openLead} />}
           {!detail && activePage === 'events' && <EventsPage showToast={showToast} />}
@@ -1951,11 +1961,34 @@ function AgendaPage({ showToast }) {
   const [eventFilter, setEventFilter] = useState('')
   const [selectedRows, setSelectedRows] = useState([])
   const [deleting, setDeleting] = useState(false)
+  const [events, setEvents] = useState([])
 
   useEffect(() => {
     fetchAgenda()
+    fetchEvents()
   }, [])
 
+
+  // ==========================================================
+  // LOAD EVENTS FOR FILTERS / EDITING
+  // ==========================================================
+
+  async function fetchEvents() {
+    const { data, error } = await supabase
+      .from('events')
+      .select('event_id, event_name, start_date')
+      .order('start_date', { ascending: false })
+
+    if (!error) setEvents(data || [])
+  }
+
+  function getEventLabel(eventId) {
+    if (!eventId) return '—'
+    const event = events.find(e => e.event_id === eventId)
+    return event?.event_name
+      ? `${event.event_id} - ${event.event_name}`
+      : eventId
+  }
 
   // ==========================================================
   // LOAD AGENDA
@@ -2569,14 +2602,10 @@ function AgendaPage({ showToast }) {
   // ==========================================================
 
   const eventOptions = useMemo(() => {
-    return [
-      ...new Set(
-        agenda
-          .map(row => row.event_id)
-          .filter(Boolean)
-      )
-    ].sort()
-  }, [agenda])
+    const known = events.map(e => e.event_id).filter(Boolean)
+    const used = agenda.map(row => row.event_id).filter(Boolean)
+    return [...new Set([...known, ...used])].sort()
+  }, [agenda, events])
 
 
   const filteredAgenda = useMemo(() => {
@@ -2811,7 +2840,7 @@ function AgendaPage({ showToast }) {
                 key={eventId}
                 value={eventId}
               >
-                {eventId}
+                {getEventLabel(eventId)}
               </option>
             ))}
 
@@ -3315,21 +3344,22 @@ function AgendaPage({ showToast }) {
 
                     {editing ? (
 
-                      <input
-                        className="crm-cell-input"
-                        value={
-                          editForm.event_id
-                        }
-                        onChange={
-                          setField(
-                            'event_id'
-                          )
-                        }
-                      />
+                      <select
+                        className="crm-cell-select"
+                        value={editForm.event_id}
+                        onChange={setField('event_id')}
+                      >
+                        <option value="">Select event</option>
+                        {eventOptions.map(eventId => (
+                          <option key={eventId} value={eventId}>
+                            {getEventLabel(eventId)}
+                          </option>
+                        ))}
+                      </select>
 
                     ) : (
 
-                      row.event_id
+                      getEventLabel(row.event_id)
 
                     )}
 
@@ -3637,6 +3667,1101 @@ function AgendaPage({ showToast }) {
 }
 
 // ============================================================================
+// SPONSORS — sponsorship_deals table
+// Shows only the operational fields requested for the CRM. Financial / closing
+// fields remain in Supabase but are intentionally not displayed on this page.
+// ============================================================================
+function SponsorsPage({ showToast }) {
+  const [deals, setDeals] = useState([])
+  const [events, setEvents] = useState([])
+  const [companyNames, setCompanyNames] = useState({})
+  const [personNames, setPersonNames] = useState({})
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+
+  const [searchTerm, setSearchTerm] = useState('')
+  const [eventFilter, setEventFilter] = useState('')
+  const [selectedRows, setSelectedRows] = useState([])
+  const [editingId, setEditingId] = useState(null)
+  const [editForm, setEditForm] = useState(null)
+  const [isAdding, setIsAdding] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+
+  useEffect(() => {
+    fetchSponsors()
+    fetchEvents()
+  }, [])
+
+  async function fetchEvents() {
+    const { data } = await supabase
+      .from('events')
+      .select('event_id, event_name, start_date')
+      .order('start_date', { ascending: false })
+
+    setEvents(data || [])
+  }
+
+  async function fetchSponsors() {
+    setLoading(true)
+    setError(null)
+
+    const { data, error } = await supabase
+      .from('sponsorship_deals')
+      .select('deal_id, event_id, company_id, contact_person_id, deal_stage, package_name, notes')
+      .order('deal_id', { ascending: false })
+
+    if (error) {
+      setError(error.message)
+      setDeals([])
+      setLoading(false)
+      return
+    }
+
+    const rows = data || []
+    setDeals(rows)
+    await loadReferenceNames(rows)
+    setLoading(false)
+  }
+
+  async function loadReferenceNames(rows) {
+    const companyIds = [...new Set(rows.map(r => r.company_id).filter(Boolean).map(Number))]
+    const personIds = [...new Set(rows.map(r => r.contact_person_id).filter(Boolean).map(Number))]
+
+    if (companyIds.length) {
+      const { data } = await supabase
+        .from('companies')
+        .select('company_id, company_name')
+        .in('company_id', companyIds)
+
+      const map = {}
+      ;(data || []).forEach(c => { map[c.company_id] = c.company_name })
+      setCompanyNames(prev => ({ ...prev, ...map }))
+    }
+
+    if (personIds.length) {
+      const { data } = await supabase
+        .from('people')
+        .select('person_id, first_name, last_name')
+        .in('person_id', personIds)
+
+      const map = {}
+      ;(data || []).forEach(p => {
+        map[p.person_id] = `${p.first_name || ''} ${p.last_name || ''}`.trim()
+      })
+      setPersonNames(prev => ({ ...prev, ...map }))
+    }
+  }
+
+  function getEventLabel(eventId) {
+    if (!eventId) return '—'
+    const event = events.find(e => e.event_id === eventId)
+    return event?.event_name
+      ? `${event.event_id} - ${event.event_name}`
+      : eventId
+  }
+
+  function getCompanyName(id) {
+    return companyNames[id] || id || '—'
+  }
+
+  function getPersonName(id) {
+    return personNames[id] || id || '—'
+  }
+
+  function rememberCompany(company) {
+    if (!company) return
+    setCompanyNames(prev => ({
+      ...prev,
+      [company.company_id]: company.company_name
+    }))
+  }
+
+  function rememberPerson(person) {
+    if (!person) return
+    const name = `${person.first_name || ''} ${person.last_name || ''}`.trim()
+    setPersonNames(prev => ({
+      ...prev,
+      [person.person_id]: name
+    }))
+  }
+
+  const eventOptions = useMemo(() => {
+    const known = events.map(e => e.event_id).filter(Boolean)
+    const used = deals.map(d => d.event_id).filter(Boolean)
+    return [...new Set([...known, ...used])].sort()
+  }, [events, deals])
+
+  const filteredDeals = useMemo(() => {
+    const search = searchTerm.trim().toLowerCase()
+
+    return deals.filter(row => {
+      if (eventFilter && row.event_id !== eventFilter) return false
+      if (!search) return true
+
+      const searchable = [
+        row.event_id,
+        getEventLabel(row.event_id),
+        getCompanyName(row.company_id),
+        getPersonName(row.contact_person_id),
+        row.deal_stage,
+        row.package_name,
+        row.notes,
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase()
+
+      return searchable.includes(search)
+    })
+  }, [deals, searchTerm, eventFilter, events, companyNames, personNames])
+
+  function setField(field) {
+    return e => setEditForm(prev => ({ ...prev, [field]: e.target.value }))
+  }
+
+  function startEdit(row) {
+    if (isAdding || editingId !== null) {
+      showToast('Finish the current edit first', true)
+      return
+    }
+
+    setEditingId(row.deal_id)
+    setEditForm({
+      event_id: row.event_id || '',
+      company_id: row.company_id ?? '',
+      contact_person_id: row.contact_person_id ?? '',
+      deal_stage: row.deal_stage || '',
+      package_name: row.package_name || '',
+      notes: row.notes || '',
+    })
+  }
+
+  function cancelEdit() {
+    setEditingId(null)
+    setEditForm(null)
+  }
+
+  function startAddRow() {
+    if (editingId !== null || isAdding) {
+      showToast('Finish the current edit first', true)
+      return
+    }
+
+    const newRow = {
+      deal_id: 'new',
+      event_id: eventFilter || '',
+      company_id: '',
+      contact_person_id: '',
+      deal_stage: '',
+      package_name: '',
+      notes: '',
+    }
+
+    setDeals(prev => [newRow, ...prev])
+    setEditingId('new')
+    setIsAdding(true)
+    setEditForm({ ...newRow })
+  }
+
+  function cancelAddRow() {
+    setDeals(prev => prev.filter(row => row.deal_id !== 'new'))
+    setEditingId(null)
+    setEditForm(null)
+    setIsAdding(false)
+  }
+
+  function buildPayload() {
+    return {
+      event_id: editForm.event_id || null,
+      company_id: editForm.company_id === '' ? null : Number(editForm.company_id),
+      contact_person_id: editForm.contact_person_id === '' ? null : Number(editForm.contact_person_id),
+      deal_stage: editForm.deal_stage.trim() || null,
+      package_name: editForm.package_name.trim() || null,
+      notes: editForm.notes.trim() || null,
+      updated_at: new Date().toISOString(),
+    }
+  }
+
+  async function saveRow(row) {
+    setSaving(true)
+    const updates = buildPayload()
+
+    const { error } = await supabase
+      .from('sponsorship_deals')
+      .update(updates)
+      .eq('deal_id', row.deal_id)
+
+    setSaving(false)
+
+    if (error) {
+      showToast(`Couldn't save sponsor: ${error.message}`, true)
+      return
+    }
+
+    setDeals(prev => prev.map(item =>
+      item.deal_id === row.deal_id ? { ...item, ...updates } : item
+    ))
+    setEditingId(null)
+    setEditForm(null)
+    showToast('Sponsor updated')
+  }
+
+  async function saveNewRow() {
+    setSaving(true)
+    const newRecord = buildPayload()
+
+    const { data, error } = await supabase
+      .from('sponsorship_deals')
+      .insert(newRecord)
+      .select('deal_id, event_id, company_id, contact_person_id, deal_stage, package_name, notes')
+      .single()
+
+    setSaving(false)
+
+    if (error) {
+      showToast(`Couldn't add sponsor: ${error.message}`, true)
+      return
+    }
+
+    setDeals(prev => prev.map(row => row.deal_id === 'new' ? data : row))
+    setEditingId(null)
+    setEditForm(null)
+    setIsAdding(false)
+    showToast('Sponsor added')
+  }
+
+  function toggleRowSelection(dealId) {
+    setSelectedRows(prev =>
+      prev.includes(dealId)
+        ? prev.filter(id => id !== dealId)
+        : [...prev, dealId]
+    )
+  }
+
+  function toggleSelectAll() {
+    const visibleIds = filteredDeals
+      .filter(row => row.deal_id !== 'new')
+      .map(row => row.deal_id)
+
+    const allSelected = visibleIds.length > 0 &&
+      visibleIds.every(id => selectedRows.includes(id))
+
+    if (allSelected) {
+      setSelectedRows(prev => prev.filter(id => !visibleIds.includes(id)))
+    } else {
+      setSelectedRows(prev => [...new Set([...prev, ...visibleIds])])
+    }
+  }
+
+  async function deleteSelectedRows() {
+    if (!selectedRows.length) {
+      showToast('Select at least one sponsor row', true)
+      return
+    }
+
+    const confirmed = window.confirm(
+      `Delete ${selectedRows.length} selected sponsor row${selectedRows.length > 1 ? 's' : ''}?`
+    )
+    if (!confirmed) return
+
+    setDeleting(true)
+    const { error } = await supabase
+      .from('sponsorship_deals')
+      .delete()
+      .in('deal_id', selectedRows)
+    setDeleting(false)
+
+    if (error) {
+      showToast(`Couldn't delete sponsor row: ${error.message}`, true)
+      return
+    }
+
+    setDeals(prev => prev.filter(row => !selectedRows.includes(row.deal_id)))
+    setSelectedRows([])
+    showToast(selectedRows.length === 1 ? 'Sponsor row deleted' : 'Sponsor rows deleted')
+  }
+
+  if (loading) {
+    return (
+      <div className="crm-loading">
+        <Loader2 size={16} className="crm-spin" /> Loading sponsors...
+      </div>
+    )
+  }
+
+  if (error) {
+    return <div className="crm-error">Couldn't load sponsors: {error}</div>
+  }
+
+  return (
+    <div>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 16,
+          marginBottom: 16,
+          flexWrap: 'wrap'
+        }}
+      >
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <input
+            className="crm-input"
+            type="text"
+            placeholder="Search sponsors..."
+            value={searchTerm}
+            onChange={e => setSearchTerm(e.target.value)}
+            style={{ width: 280 }}
+          />
+
+          <select
+            className="crm-input"
+            value={eventFilter}
+            onChange={e => setEventFilter(e.target.value)}
+            style={{ width: 300 }}
+          >
+            <option value="">All Events</option>
+            {eventOptions.map(eventId => (
+              <option key={eventId} value={eventId}>
+                {getEventLabel(eventId)}
+              </option>
+            ))}
+          </select>
+
+          {(searchTerm || eventFilter) && (
+            <button
+              className="crm-btn-secondary"
+              onClick={() => {
+                setSearchTerm('')
+                setEventFilter('')
+              }}
+            >
+              Clear
+            </button>
+          )}
+        </div>
+
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <button
+            className="crm-btn-secondary"
+            onClick={deleteSelectedRows}
+            disabled={selectedRows.length === 0 || deleting || editingId !== null}
+          >
+            {deleting
+              ? 'Deleting...'
+              : `Delete Selected${selectedRows.length ? ` (${selectedRows.length})` : ''}`}
+          </button>
+
+          <button
+            className="crm-submit-btn"
+            style={{ width: 'auto', padding: '9px 16px' }}
+            onClick={startAddRow}
+            disabled={isAdding || editingId !== null}
+          >
+            + Add Sponsor
+          </button>
+        </div>
+      </div>
+
+      <div className="crm-table-wrap">
+        <table className="crm-table" style={{ minWidth: 1100 }}>
+          <thead>
+            <tr>
+              <th style={{ width: 40, textAlign: 'center' }}>
+                <input
+                  type="checkbox"
+                  checked={
+                    filteredDeals.filter(row => row.deal_id !== 'new').length > 0 &&
+                    filteredDeals
+                      .filter(row => row.deal_id !== 'new')
+                      .every(row => selectedRows.includes(row.deal_id))
+                  }
+                  onChange={toggleSelectAll}
+                />
+              </th>
+              <th>Event</th>
+              <th>Company</th>
+              <th>Contact Person</th>
+              <th>Deal Stage</th>
+              <th>Package</th>
+              <th>Notes</th>
+              <th></th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {filteredDeals.map(row => {
+              const editing = editingId === row.deal_id
+
+              return (
+                <tr key={row.deal_id} className={editing ? 'editing' : ''}>
+                  <td style={{ textAlign: 'center' }}>
+                    {row.deal_id !== 'new' && (
+                      <input
+                        type="checkbox"
+                        checked={selectedRows.includes(row.deal_id)}
+                        onChange={() => toggleRowSelection(row.deal_id)}
+                      />
+                    )}
+                  </td>
+
+                  <td style={{ minWidth: 240 }}>
+                    {editing ? (
+                      <select
+                        className="crm-cell-select"
+                        value={editForm.event_id}
+                        onChange={setField('event_id')}
+                      >
+                        <option value="">Select event</option>
+                        {eventOptions.map(eventId => (
+                          <option key={eventId} value={eventId}>
+                            {getEventLabel(eventId)}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      getEventLabel(row.event_id)
+                    )}
+                  </td>
+
+                  <td style={{ minWidth: 190 }}>
+                    {editing ? (
+                      <CompanySearchPicker
+                        value={editForm.company_id}
+                        displayName={editForm.company_id ? getCompanyName(editForm.company_id) : ''}
+                        onChange={(value, company) => {
+                          if (company) rememberCompany(company)
+                          setEditForm(prev => ({ ...prev, company_id: value }))
+                        }}
+                        placeholder="Search sponsor company..."
+                      />
+                    ) : (
+                      row.company_id ? getCompanyName(row.company_id) : '—'
+                    )}
+                  </td>
+
+                  <td style={{ minWidth: 190 }}>
+                    {editing ? (
+                      <PersonSearchPicker
+                        value={editForm.contact_person_id}
+                        displayName={editForm.contact_person_id ? getPersonName(editForm.contact_person_id) : ''}
+                        onChange={(value, person) => {
+                          if (person) rememberPerson(person)
+                          setEditForm(prev => ({ ...prev, contact_person_id: value }))
+                        }}
+                        placeholder="Search contact person..."
+                      />
+                    ) : (
+                      row.contact_person_id ? getPersonName(row.contact_person_id) : '—'
+                    )}
+                  </td>
+
+                  <td>
+                    {editing ? (
+                      <input
+                        className="crm-cell-input"
+                        value={editForm.deal_stage}
+                        onChange={setField('deal_stage')}
+                        placeholder="e.g. Proposal"
+                      />
+                    ) : (
+                      row.deal_stage || '—'
+                    )}
+                  </td>
+
+                  <td>
+                    {editing ? (
+                      <input
+                        className="crm-cell-input"
+                        value={editForm.package_name}
+                        onChange={setField('package_name')}
+                        placeholder="Package name"
+                      />
+                    ) : (
+                      row.package_name || '—'
+                    )}
+                  </td>
+
+                  <td style={{ minWidth: 220 }}>
+                    {editing ? (
+                      <textarea
+                        className="crm-cell-input"
+                        value={editForm.notes}
+                        onChange={setField('notes')}
+                        rows={2}
+                        style={{ resize: 'vertical' }}
+                      />
+                    ) : (
+                      <div className="crm-notes-cell" title={row.notes || ''}>
+                        {row.notes || '—'}
+                      </div>
+                    )}
+                  </td>
+
+                  <td>
+                    {editing ? (
+                      <div style={{ display: 'flex', gap: 6, whiteSpace: 'nowrap' }}>
+                        <button
+                          className="crm-submit-btn"
+                          style={{ width: 'auto', padding: '7px 12px' }}
+                          disabled={saving}
+                          onClick={() => {
+                            if (isAdding && row.deal_id === 'new') saveNewRow()
+                            else saveRow(row)
+                          }}
+                        >
+                          {saving ? 'Saving...' : 'Save'}
+                        </button>
+                        <button
+                          className="crm-btn-secondary"
+                          disabled={saving}
+                          onClick={() => {
+                            if (isAdding && row.deal_id === 'new') cancelAddRow()
+                            else cancelEdit()
+                          }}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button className="crm-btn-secondary" onClick={() => startEdit(row)}>
+                        Edit
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              )
+            })}
+
+            {filteredDeals.length === 0 && (
+              <tr>
+                <td colSpan={8} style={{ textAlign: 'center', padding: 30 }}>
+                  {deals.length === 0
+                    ? 'No sponsorship deals found.'
+                    : 'No sponsorship deals match your search.'}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+// ============================================================================
+// DISPLAY ORDER — Advisory Board + Speakers
+// Only the ordering columns can be edited on this page.
+// ABM comes directly from people where lead_purpose = 'ABM'.
+// Speakers are event-specific confirmed speakers from event_participants.
+// ============================================================================
+function DisplayOrderPage({ showToast }) {
+  const [activeTab, setActiveTab] = useState('abm')
+  const [searchTerm, setSearchTerm] = useState('')
+
+  const [abmRows, setAbmRows] = useState([])
+  const [abmLoading, setAbmLoading] = useState(true)
+  const [abmError, setAbmError] = useState(null)
+  const [editingAbmId, setEditingAbmId] = useState(null)
+  const [abmOrderDraft, setAbmOrderDraft] = useState('')
+  const [savingAbm, setSavingAbm] = useState(false)
+
+  const [events, setEvents] = useState([])
+  const [selectedEventId, setSelectedEventId] = useState('')
+  const [speakerRows, setSpeakerRows] = useState([])
+  const [speakersLoading, setSpeakersLoading] = useState(false)
+  const [speakersError, setSpeakersError] = useState(null)
+  const [editingSpeakerId, setEditingSpeakerId] = useState(null)
+  const [speakerOrderDraft, setSpeakerOrderDraft] = useState('')
+  const [savingSpeaker, setSavingSpeaker] = useState(false)
+
+  useEffect(() => {
+    fetchAbm()
+    fetchEvents()
+  }, [])
+
+  useEffect(() => {
+    if (selectedEventId) fetchSpeakers(selectedEventId)
+    else setSpeakerRows([])
+  }, [selectedEventId])
+
+  async function fetchAbm() {
+    setAbmLoading(true)
+    setAbmError(null)
+
+    const { data, error } = await supabase
+      .from('people')
+      .select(`
+        person_id,
+        first_name,
+        last_name,
+        job_title,
+        company_id,
+        abm_order,
+        companies(company_name)
+      `)
+      .eq('lead_purpose', 'ABM')
+
+    if (error) {
+      setAbmError(error.message)
+      setAbmRows([])
+      setAbmLoading(false)
+      return
+    }
+
+    const rows = [...(data || [])].sort((a, b) => {
+      const ao = a.abm_order == null ? Number.MAX_SAFE_INTEGER : Number(a.abm_order)
+      const bo = b.abm_order == null ? Number.MAX_SAFE_INTEGER : Number(b.abm_order)
+      if (ao !== bo) return ao - bo
+      const an = `${a.first_name || ''} ${a.last_name || ''}`.trim()
+      const bn = `${b.first_name || ''} ${b.last_name || ''}`.trim()
+      return an.localeCompare(bn)
+    })
+
+    setAbmRows(rows)
+    setAbmLoading(false)
+  }
+
+  async function fetchEvents() {
+    const { data, error } = await supabase
+      .from('events')
+      .select('event_id, event_name, start_date')
+      .order('start_date', { ascending: false })
+
+    if (error) {
+      showToast(`Couldn't load events: ${error.message}`, true)
+      return
+    }
+
+    const rows = data || []
+    setEvents(rows)
+    if (rows.length && !selectedEventId) setSelectedEventId(rows[0].event_id)
+  }
+
+  async function fetchSpeakers(eventId) {
+    setSpeakersLoading(true)
+    setSpeakersError(null)
+
+    const { data, error } = await supabase
+      .from('event_participants')
+      .select(`
+        participant_id,
+        person_id,
+        company_id,
+        event_id,
+        role,
+        status,
+        display_order,
+        people(first_name, last_name, job_title),
+        companies(company_name)
+      `)
+      .eq('event_id', eventId)
+      .eq('role', 'Speaker')
+      .eq('status', 'Confirmed')
+
+    if (error) {
+      setSpeakersError(error.message)
+      setSpeakerRows([])
+      setSpeakersLoading(false)
+      return
+    }
+
+    const rows = [...(data || [])].sort((a, b) => {
+      const ao = a.display_order == null ? Number.MAX_SAFE_INTEGER : Number(a.display_order)
+      const bo = b.display_order == null ? Number.MAX_SAFE_INTEGER : Number(b.display_order)
+      if (ao !== bo) return ao - bo
+      const an = `${a.people?.first_name || ''} ${a.people?.last_name || ''}`.trim()
+      const bn = `${b.people?.first_name || ''} ${b.people?.last_name || ''}`.trim()
+      return an.localeCompare(bn)
+    })
+
+    setSpeakerRows(rows)
+    setSpeakersLoading(false)
+  }
+
+  function eventLabel(eventId) {
+    const event = events.find(e => e.event_id === eventId)
+    return event?.event_name ? `${event.event_id} - ${event.event_name}` : eventId
+  }
+
+  const filteredAbm = useMemo(() => {
+    const search = searchTerm.trim().toLowerCase()
+    if (!search) return abmRows
+
+    return abmRows.filter(row => {
+      const text = [
+        row.first_name,
+        row.last_name,
+        row.job_title,
+        row.companies?.company_name,
+        row.abm_order,
+      ].filter(v => v !== null && v !== undefined).join(' ').toLowerCase()
+      return text.includes(search)
+    })
+  }, [abmRows, searchTerm])
+
+  const filteredSpeakers = useMemo(() => {
+    const search = searchTerm.trim().toLowerCase()
+    if (!search) return speakerRows
+
+    return speakerRows.filter(row => {
+      const text = [
+        row.people?.first_name,
+        row.people?.last_name,
+        row.people?.job_title,
+        row.companies?.company_name,
+        row.display_order,
+      ].filter(v => v !== null && v !== undefined).join(' ').toLowerCase()
+      return text.includes(search)
+    })
+  }, [speakerRows, searchTerm])
+
+  function startAbmEdit(row) {
+    setEditingSpeakerId(null)
+    setEditingAbmId(row.person_id)
+    setAbmOrderDraft(row.abm_order ?? '')
+  }
+
+  function cancelAbmEdit() {
+    setEditingAbmId(null)
+    setAbmOrderDraft('')
+  }
+
+  async function saveAbmOrder(row) {
+    setSavingAbm(true)
+    const value = abmOrderDraft === '' ? null : Number(abmOrderDraft)
+
+    const { error } = await supabase
+      .from('people')
+      .update({
+        abm_order: value,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('person_id', row.person_id)
+
+    setSavingAbm(false)
+
+    if (error) {
+      showToast(`Couldn't update ABM order: ${error.message}`, true)
+      return
+    }
+
+    setAbmRows(prev => prev
+      .map(item => item.person_id === row.person_id ? { ...item, abm_order: value } : item)
+      .sort((a, b) => {
+        const ao = a.abm_order == null ? Number.MAX_SAFE_INTEGER : Number(a.abm_order)
+        const bo = b.abm_order == null ? Number.MAX_SAFE_INTEGER : Number(b.abm_order)
+        return ao - bo
+      })
+    )
+
+    setEditingAbmId(null)
+    setAbmOrderDraft('')
+    showToast('Advisory Board display order updated')
+  }
+
+  function startSpeakerEdit(row) {
+    setEditingAbmId(null)
+    setEditingSpeakerId(row.participant_id)
+    setSpeakerOrderDraft(row.display_order ?? '')
+  }
+
+  function cancelSpeakerEdit() {
+    setEditingSpeakerId(null)
+    setSpeakerOrderDraft('')
+  }
+
+  async function saveSpeakerOrder(row) {
+    setSavingSpeaker(true)
+    const value = speakerOrderDraft === '' ? null : Number(speakerOrderDraft)
+
+    const { error } = await supabase
+      .from('event_participants')
+      .update({
+        display_order: value,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('participant_id', row.participant_id)
+
+    setSavingSpeaker(false)
+
+    if (error) {
+      showToast(`Couldn't update speaker order: ${error.message}`, true)
+      return
+    }
+
+    setSpeakerRows(prev => prev
+      .map(item => item.participant_id === row.participant_id ? { ...item, display_order: value } : item)
+      .sort((a, b) => {
+        const ao = a.display_order == null ? Number.MAX_SAFE_INTEGER : Number(a.display_order)
+        const bo = b.display_order == null ? Number.MAX_SAFE_INTEGER : Number(b.display_order)
+        return ao - bo
+      })
+    )
+
+    setEditingSpeakerId(null)
+    setSpeakerOrderDraft('')
+    showToast('Speaker display order updated')
+  }
+
+  return (
+    <div>
+      <div className="crm-tabs" style={{ marginBottom: 18 }}>
+        <button
+          className={`crm-tab-btn${activeTab === 'abm' ? ' active' : ''}`}
+          onClick={() => {
+            setActiveTab('abm')
+            setSearchTerm('')
+            cancelSpeakerEdit()
+          }}
+        >
+          Advisory Board
+        </button>
+        <button
+          className={`crm-tab-btn${activeTab === 'speakers' ? ' active' : ''}`}
+          onClick={() => {
+            setActiveTab('speakers')
+            setSearchTerm('')
+            cancelAbmEdit()
+          }}
+        >
+          Speakers
+        </button>
+      </div>
+
+      <div className="crm-toolbar">
+        <div className="crm-search-box" style={{ maxWidth: 360 }}>
+          <Search size={16} />
+          <input
+            value={searchTerm}
+            onChange={e => setSearchTerm(e.target.value)}
+            placeholder={activeTab === 'abm' ? 'Search Advisory Board...' : 'Search speakers...'}
+          />
+        </div>
+
+        {activeTab === 'speakers' && (
+          <select
+            className="crm-filter-select"
+            value={selectedEventId}
+            onChange={e => {
+              setSelectedEventId(e.target.value)
+              setEditingSpeakerId(null)
+              setSpeakerOrderDraft('')
+            }}
+            style={{ minWidth: 300 }}
+          >
+            <option value="">Select event</option>
+            {events.map(event => (
+              <option key={event.event_id} value={event.event_id}>
+                {eventLabel(event.event_id)}
+              </option>
+            ))}
+          </select>
+        )}
+
+        <span className="crm-count-note">
+          {activeTab === 'abm' ? `${filteredAbm.length} members` : `${filteredSpeakers.length} speakers`}
+        </span>
+      </div>
+
+      {activeTab === 'abm' && (
+        <>
+          {abmLoading && (
+            <div className="crm-loading"><Loader2 size={16} className="crm-spin" /> Loading Advisory Board...</div>
+          )}
+
+          {abmError && (
+            <div className="crm-error">Couldn't load Advisory Board: {abmError}</div>
+          )}
+
+          {!abmLoading && !abmError && (
+            <div className="crm-table-wrap">
+              <table className="crm-table" style={{ minWidth: 760 }}>
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Company</th>
+                    <th>Job Title</th>
+                    <th style={{ width: 140 }}>Display Order</th>
+                    <th style={{ width: 170 }}>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredAbm.map(row => {
+                    const editing = editingAbmId === row.person_id
+                    return (
+                      <tr key={row.person_id}>
+                        <td>
+                          <div className="crm-name-cell">
+                            <div className="crm-avatar" style={avatarStyle(`${row.first_name || ''} ${row.last_name || ''}`)}>
+                              {initials(row.first_name, row.last_name)}
+                            </div>
+                            {`${row.first_name || ''} ${row.last_name || ''}`.trim() || `Person ${row.person_id}`}
+                          </div>
+                        </td>
+                        <td>{row.companies?.company_name || '—'}</td>
+                        <td>{row.job_title || '—'}</td>
+                        <td>
+                          {editing ? (
+                            <input
+                              className="crm-cell-input"
+                              type="number"
+                              min="0"
+                              value={abmOrderDraft}
+                              onChange={e => setAbmOrderDraft(e.target.value)}
+                              style={{ maxWidth: 100 }}
+                            />
+                          ) : (
+                            row.abm_order ?? '—'
+                          )}
+                        </td>
+                        <td>
+                          {editing ? (
+                            <div className="crm-row-actions">
+                              <button
+                                className="crm-icon-action save"
+                                onClick={() => saveAbmOrder(row)}
+                                disabled={savingAbm}
+                                title="Save order"
+                              >
+                                {savingAbm ? <Loader2 size={14} className="crm-spin" /> : <Save size={14} />}
+                              </button>
+                              <button
+                                className="crm-icon-action cancel"
+                                onClick={cancelAbmEdit}
+                                disabled={savingAbm}
+                                title="Cancel"
+                              >
+                                <X size={14} />
+                              </button>
+                            </div>
+                          ) : (
+                            <button className="crm-btn-secondary" onClick={() => startAbmEdit(row)}>
+                              Edit Order
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    )
+                  })}
+
+                  {filteredAbm.length === 0 && (
+                    <tr className="crm-empty-row">
+                      <td colSpan={5}>No Advisory Board members found.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
+
+      {activeTab === 'speakers' && (
+        <>
+          {!selectedEventId && (
+            <div className="crm-loading">Select an event to view confirmed speakers.</div>
+          )}
+
+          {selectedEventId && speakersLoading && (
+            <div className="crm-loading"><Loader2 size={16} className="crm-spin" /> Loading speakers...</div>
+          )}
+
+          {selectedEventId && speakersError && (
+            <div className="crm-error">Couldn't load speakers: {speakersError}</div>
+          )}
+
+          {selectedEventId && !speakersLoading && !speakersError && (
+            <div className="crm-table-wrap">
+              <table className="crm-table" style={{ minWidth: 760 }}>
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Company</th>
+                    <th>Job Title</th>
+                    <th style={{ width: 140 }}>Display Order</th>
+                    <th style={{ width: 170 }}>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredSpeakers.map(row => {
+                    const editing = editingSpeakerId === row.participant_id
+                    const firstName = row.people?.first_name || ''
+                    const lastName = row.people?.last_name || ''
+                    return (
+                      <tr key={row.participant_id}>
+                        <td>
+                          <div className="crm-name-cell">
+                            <div className="crm-avatar" style={avatarStyle(`${firstName} ${lastName}`)}>
+                              {initials(firstName, lastName)}
+                            </div>
+                            {`${firstName} ${lastName}`.trim() || `Person ${row.person_id}`}
+                          </div>
+                        </td>
+                        <td>{row.companies?.company_name || '—'}</td>
+                        <td>{row.people?.job_title || '—'}</td>
+                        <td>
+                          {editing ? (
+                            <input
+                              className="crm-cell-input"
+                              type="number"
+                              min="0"
+                              value={speakerOrderDraft}
+                              onChange={e => setSpeakerOrderDraft(e.target.value)}
+                              style={{ maxWidth: 100 }}
+                            />
+                          ) : (
+                            row.display_order ?? '—'
+                          )}
+                        </td>
+                        <td>
+                          {editing ? (
+                            <div className="crm-row-actions">
+                              <button
+                                className="crm-icon-action save"
+                                onClick={() => saveSpeakerOrder(row)}
+                                disabled={savingSpeaker}
+                                title="Save order"
+                              >
+                                {savingSpeaker ? <Loader2 size={14} className="crm-spin" /> : <Save size={14} />}
+                              </button>
+                              <button
+                                className="crm-icon-action cancel"
+                                onClick={cancelSpeakerEdit}
+                                disabled={savingSpeaker}
+                                title="Cancel"
+                              >
+                                <X size={14} />
+                              </button>
+                            </div>
+                          ) : (
+                            <button className="crm-btn-secondary" onClick={() => startSpeakerEdit(row)}>
+                              Edit Order
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    )
+                  })}
+
+                  {filteredSpeakers.length === 0 && (
+                    <tr className="crm-empty-row">
+                      <td colSpan={5}>No confirmed speakers found for this event.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+// ============================================================================
 // PEOPLE — live data, search, pagination. Display-only by default:
 //  - clicking a row opens the full Person detail page
 //  - a pencil icon on the row opens a lightweight inline edit for that one row
@@ -3669,15 +4794,9 @@ function PeoplePage({
     return Array.from(set).sort()
   }, [people])
 
-  const LEAD_PURPOSE_OPTIONS = useMemo(() => {
-    const set = new Set(people.map(p => p.lead_purpose).filter(Boolean))
-    return Array.from(set).sort()
-  }, [people])
-
-  const COMBINED_PURPOSE_OPTIONS = useMemo(() => {
-    const set = new Set([...LEAD_PURPOSE_CHOICES, ...LEAD_PURPOSE_OPTIONS])
-    return Array.from(set).sort()
-  }, [LEAD_PURPOSE_OPTIONS])
+  // Keep lead purpose filters consistent with the approved CRM choices only.
+  // Do not pull historical values (such as Speaker Acquisition) back from the database.
+  const COMBINED_PURPOSE_OPTIONS = LEAD_PURPOSE_CHOICES
 
   const [columnFilters, setColumnFilters] = useState({
     name: '',
@@ -5733,12 +6852,11 @@ const [neighbors, setNeighbors] = useState({ previousId: null, nextId: null })
   const [statusOptions, setStatusOptions] = useState([])
   useEffect(() => {
     (async () => {
-      const { data, error } = await supabase.from('people').select('status, lead_purpose')
+      const { data, error } = await supabase.from('people').select('status')
       if (error || !data) return
       setStatusOptions(Array.from(new Set(data.map(r => r.status).filter(Boolean))).sort())
-      setPurposeOptions(
-        Array.from(new Set([...LEAD_PURPOSE_CHOICES, ...data.map(r => r.lead_purpose).filter(Boolean)])).sort()
-      )
+      // Fixed approved choices only — never reintroduce historical database values.
+      setPurposeOptions(LEAD_PURPOSE_CHOICES)
     })()
   }, [])
 
@@ -5986,9 +7104,6 @@ const save = async () => {
             <FieldLabel>Lead purpose</FieldLabel>
             <select className="crm-select" value={form.lead_purpose} onChange={set('lead_purpose')}>
               <option value="">—</option>
-              {form.lead_purpose && !purposeOptions.includes(form.lead_purpose) && (
-                <option value={form.lead_purpose}>{form.lead_purpose}</option>
-              )}
               {purposeOptions.map(p => <option key={p} value={p}>{p}</option>)}
             </select>
           </div>
